@@ -5,49 +5,78 @@ set -e  # Stop on any errors
 # Error handler
 source ./scripts/error_handler.sh
 
-echo "Partitioning the disk..."
+# ANSI color codes for formatting
+RED="\033[1;31m"
+GREEN="\033[1;32m"
+YELLOW="\033[1;33m"
+CYAN="\033[1;36m"
+NC="\033[0m"  # No color
 
-# Select the disk (you can improve this by listing disks dynamically)
-DISK="/dev/sda"
+clear  # Clear the terminal for a fresh start
 
-# Ask the user to confirm the correct disk
-read -p "Please confirm the disk to partition (default: /dev/sda): " input_disk
-DISK="${input_disk:-$DISK}"
+# Title
+printf "${CYAN}==================== Arch Linux Disk Partitioning Script ====================${NC}\n\n"
+
+echo "Scanning your system for disk and specs..."
+
+# Find the primary disk dynamically
+DISK=$(lsblk -dpno name,size | grep -E "sd|nvme|vd" | head -n 1 | awk '{print $1}')
 
 # Get the total size of the disk in GiB
 total_size=$(parted -s "$DISK" unit GiB print | grep "^Disk" | awk '{print $3}' | sed 's/GiB//')
 
-echo "Total size of $DISK: $total_size GiB"
+# Display detected disk info
+printf "${YELLOW}Detected Disk:${NC} ${DISK} (${total_size} GiB)\n\n"
+
+# Gather hardware info to make recommendations
+RAM=$(free -g | awk '/^Mem:/{print $2}')
+CPU=$(lscpu | grep 'Model name' | awk -F: '{print $2}' | xargs)
+
+# System info
+printf "${YELLOW}System Info:${NC}\n"
+printf "  - CPU: ${CYAN}${CPU}${NC}\n"
+printf "  - RAM: ${CYAN}${RAM}GB${NC}\n\n"
 
 # Recommendations for partition sizes
-echo "Recommended partition sizes:"
-echo "  - Root partition: 20-40 GiB (for minimal setups), 40-100 GiB (for desktop environments with many applications)"
-echo "  - Swap partition: 2-8 GiB (depends on RAM size; equal to RAM is a common rule of thumb)"
-echo "  - Home partition: Use remaining space for user data"
+printf "${YELLOW}Recommended partition sizes based on your system:${NC}\n"
+if [ "$RAM" -lt 4 ]; then
+    printf "  - Root partition: ${CYAN}20 GiB${NC} (minimal setup)\n"
+    printf "  - Swap partition: ${CYAN}2 GiB${NC} (for low RAM)\n"
+else
+    printf "  - Root partition: ${CYAN}40 GiB${NC} (recommended for desktops)\n"
+    printf "  - Swap partition: ${CYAN}${RAM} GiB${NC} (equal to RAM)\n"
+fi
+printf "  - Home partition: ${CYAN}Remaining space${NC} for user data\n\n"
 
-# Prompt user for sizes
-echo "Enter the size for the root partition (default: 40 GiB):"
-read -p "Size in GiB: " root_size
+# Prompt user for partition sizes
+read -p "Enter the size for the root partition (default: 40 GiB): " root_size
 root_size="${root_size:-40}"
 
-echo "Enter the size for the swap partition (default: 4 GiB):"
-read -p "Size in GiB: " swap_size
-swap_size="${swap_size:-4}"
+read -p "Enter the size for the swap partition (default: $RAM GiB): " swap_size
+swap_size="${swap_size:-$RAM}"
 
-# Calculate remaining size for home partition
+# Calculate remaining space for home partition
 home_size=$((total_size - root_size - swap_size - 1))  # 1 GiB for EFI
 
-if [ $home_size -le 0 ]; then
-    echo "Error: The sizes you entered exceed the available disk space."
+if [ "$home_size" -le 0 ]; then
+    printf "${RED}Error:${NC} The sizes you entered exceed available disk space.\n"
     exit 1
 fi
 
-echo "Root partition size: $root_size GiB"
-echo "Swap partition size: $swap_size GiB"
-echo "Home partition size: $home_size GiB"
+# Display partition sizes
+printf "\n${GREEN}Partition Layout:${NC}\n"
+printf "  - Root partition size: ${CYAN}${root_size} GiB${NC}\n"
+printf "  - Swap partition size: ${CYAN}${swap_size} GiB${NC}\n"
+printf "  - Home partition size: ${CYAN}${home_size} GiB${NC}\n\n"
 
-# Create partitions (UEFI, root, swap, and home)
-echo "Creating partitions on $DISK..."
+# Encryption Option for Root or Home
+printf "${YELLOW}Would you like to encrypt the root or home partition?${NC} (Enter 'root', 'home', or 'none')\n"
+read encryption_choice
+
+# Partition creation with LUKS encryption if selected
+printf "\n${CYAN}Creating partitions on ${DISK}...${NC}\n"
+
+# Create partitions
 parted --script "$DISK" mklabel gpt \
   mkpart ESP fat32 1MiB 513MiB \
   set 1 boot on \
@@ -55,23 +84,38 @@ parted --script "$DISK" mklabel gpt \
   mkpart primary linux-swap "$((513 + root_size))GiB" "$((513 + root_size + swap_size))GiB" \
   mkpart primary ext4 "$((513 + root_size + swap_size))GiB" "$total_size GiB"
 
-# Format the partitions
-echo "Formatting partitions..."
-mkfs.fat -F32 "${DISK}1"  # EFI partition
-mkfs.ext4 "${DISK}2"  # Root partition
-mkswap "${DISK}3"  # Swap partition
-mkfs.ext4 "${DISK}4"  # Home partition
+# Format EFI partition
+mkfs.fat -F32 "${DISK}1"
 
-# Mount the partitions
-echo "Mounting partitions..."
-mount "${DISK}2" /mnt  # Root
-mkdir /mnt/boot
-mount "${DISK}1" /mnt/boot  # EFI
-mkdir /mnt/home
-mount "${DISK}4" /mnt/home  # Home
-swapon "${DISK}3"  # Enable swap
+# Apply encryption if selected
+if [ "$encryption_choice" == "root" ]; then
+    printf "${GREEN}Encrypting root partition...${NC}\n"
+    cryptsetup luksFormat "${DISK}2"
+    cryptsetup open "${DISK}2" cryptroot
+    mkfs.ext4 /dev/mapper/cryptroot
+    mount /dev/mapper/cryptroot /mnt
+elif [ "$encryption_choice" == "home" ]; then
+    printf "${GREEN}Encrypting home partition...${NC}\n"
+    mkfs.ext4 "${DISK}2"
+    mount "${DISK}2" /mnt
+    cryptsetup luksFormat "${DISK}4"
+    cryptsetup open "${DISK}4" crypthome
+    mkfs.ext4 /dev/mapper/crypthome
+    mkdir /mnt/home
+    mount /dev/mapper/crypthome /mnt/home
+else
+    mkfs.ext4 "${DISK}2"
+    mkfs.ext4 "${DISK}4"
+    mount "${DISK}2" /mnt
+    mkdir /mnt/home
+    mount "${DISK}4" /mnt/home
+fi
 
-echo "Partitions created and mounted successfully."
+# Format and enable swap
+mkswap "${DISK}3"
+swapon "${DISK}3"
+
+printf "\n${GREEN}Partitions created and mounted successfully.${NC}\n\n"
 
 # Move to the next script
 ./scripts/next_script.sh ./scripts/02_install.sh
